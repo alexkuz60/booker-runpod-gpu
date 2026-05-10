@@ -302,8 +302,9 @@ def handler(event):
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    runpod.serverless.start({
-        "handler": handler,
-        "return_aggregate_stream": True,
-    })
+# RunPod Serverless entrypoint — must be at module level so RunPod's
+# GitHub indexer can detect runpod.serverless.start() in the default branch.
+runpod.serverless.start({
+    "handler": handler,
+    "return_aggregate_stream": True,
+})
