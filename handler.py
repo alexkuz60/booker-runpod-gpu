@@ -1,293 +1,241 @@
-# handler.py — Booker GPU backend on RunPod Serverless (OmniVoice via omnivoice-server)
-# ============================================================================
-# v2 (2026-05-31): добавлена HMAC-диагностика. При bad_signature handler
-# возвращает поля для побайтового сравнения с edge function:
-#   inner_len_bytes, inner_sha256, inner_head, inner_tail, ts, sig.
-# Сравните их с логом `[runpod-proxy][hmac-debug]` в Supabase Edge Logs.
-# ============================================================================
+"""
+booker-runpod-gpu — RunPod Serverless handler with FULL diagnostic yields.
+
+Контракт со стороны Lovable Edge (synthesize-scene-runpod):
+  - RunPod payload: { "input": { ...innerInput, "_hmac": {"ts": "...", "sig": "..."} } }
+  - innerInput = { ...originalClientPayload, "user_id_hash": "<8hex>" }
+  - HMAC SHA-256:  hex( HMAC(SHARED_TOKEN, f"{ts}.{json.dumps(innerInput, separators=(',',':'), ensure_ascii=False)}") )
+  - innerInput НЕ содержит ключа "_hmac" на момент подписи (он добавляется ПОСЛЕ подписи).
+
+КРИТИЧНО:
+  1. handler — async generator с yield (НЕ return [...]).
+  2. runpod.serverless.start({"handler": handler, "return_aggregate_stream": True}).
+  3. Любая ошибка/валидация — yield {"type":"error", ...}; return  (НЕ молчаливый return).
+  4. Первый yield — "start" с эхом ключей payload, чтобы видеть, что handler вообще получил данные.
+"""
 
 import os
-import io
-import time
 import json
 import hmac
-import base64
 import hashlib
-import subprocess
+import time
+import traceback
+from typing import Any, Dict, AsyncGenerator
 
 import runpod
-import httpx
 
-OMNI_HOST = "127.0.0.1"
-OMNI_PORT = 8880
-OMNI_BASE = f"http://{OMNI_HOST}:{OMNI_PORT}"
-TARGET_SR = 44100  # project Audio Standard
 
-GPU_NAME = os.environ.get("RUNPOD_GPU_TYPE", "RTX-4090")
 SHARED_TOKEN = os.environ.get("RUNPOD_SHARED_TOKEN", "")
-
-# ── Boot omnivoice-server once per cold-start ────────────────────────────────
-_server_proc = None
+HMAC_MAX_SKEW_MS = 10 * 60 * 1000  # 10 минут — окно для ts
 
 
-def _start_omnivoice_server():
-    """Boot omnivoice-server as a subprocess and wait for /health."""
-    global _server_proc
-    if _server_proc and _server_proc.poll() is None:
-        return
+# ─────────────────────────────── HMAC ──────────────────────────────────────
 
-    runtime_dir = "/tmp/omnivoice-runtime"
-    os.makedirs(runtime_dir, exist_ok=True)
-
-    env = os.environ.copy()
-    for k in list(env.keys()):
-        if k.startswith(("VITE_", "SUPABASE_", "RUNPOD_")):
-            env.pop(k, None)
-
-    print(f"[boot] starting omnivoice-server on {OMNI_BASE}", flush=True)
-    _server_proc = subprocess.Popen(
-        [
-            "omnivoice-server",
-            "--host", OMNI_HOST,
-            "--port", str(OMNI_PORT),
-            "--device", "cuda",
-        ],
-        cwd=runtime_dir,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        bufsize=1,
-        text=True,
-    )
-
-    deadline = time.time() + 600
-    last_err = None
-    started = time.time()
-    with httpx.Client(timeout=5.0) as client:
-        while time.time() < deadline:
-            if _server_proc.poll() is not None:
-                out = _server_proc.stdout.read() if _server_proc.stdout else ""
-                raise RuntimeError(f"omnivoice-server died on boot:\n{out}")
-            try:
-                r = client.get(f"{OMNI_BASE}/health")
-                if r.status_code == 200:
-                    print(f"[boot] omnivoice-server ready in "
-                          f"{int(time.time() - started)}s", flush=True)
-                    return
-            except Exception as e:
-                last_err = e
-            time.sleep(2)
-
-    raise RuntimeError(f"omnivoice-server /health timeout: {last_err}")
-
-
-# ── HMAC verification + diagnostics ─────────────────────────────────────────
-def _canonical_inner(inp_without_hmac: dict) -> str:
+def _canonical_inner(payload_without_hmac: Dict[str, Any]) -> str:
     """
-    Re-serialize inner payload matching JS default `JSON.stringify`:
-      - no extra whitespace
-      - keys NOT sorted (insertion order preserved)
-      - ensure_ascii=False (non-ASCII written as UTF-8)
-    NOTE: This is the known weak point — Python and JS may still differ on
-    float formatting (1.0 vs 1) and Unicode normalization. The debug fields
-    below let us pinpoint any mismatch byte-by-byte.
+    ВАЖНО: точное совпадение с тем, что подписывает Edge:
+      JSON.stringify(innerInput)  ⟶ json.dumps(..., separators=(',',':'), ensure_ascii=False)
+    Порядок ключей в Python 3.7+ сохраняется как insertion order, что соответствует
+    JavaScript object property order для строковых ключей.
     """
-    return json.dumps(inp_without_hmac, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(payload_without_hmac, separators=(",", ":"), ensure_ascii=False)
 
 
-def _hmac_debug(inner_str: str, ts: str, sig: str) -> dict:
-    inner_bytes = inner_str.encode("utf-8")
-    sha = hashlib.sha256(inner_bytes).hexdigest()
-    return {
-        "ts": ts,
-        "sig": sig,
-        "inner_len_bytes": len(inner_bytes),
-        "inner_sha256": sha,
-        "inner_head": inner_str[:80],
-        "inner_tail": inner_str[-80:],
-        "shared_token_len": len(SHARED_TOKEN),
-    }
-
-
-def _verify_signature(input_str: str, ts: str, sig: str) -> bool:
-    if not SHARED_TOKEN or not ts or not sig:
-        return False
-    try:
-        ts_int = int(ts)
-    except ValueError:
-        return False
-    if abs(ts_int - int(time.time() * 1000)) > 5 * 60_000:
-        return False
-    expected = hmac.new(
-        SHARED_TOKEN.encode(),
-        f"{ts}.{input_str}".encode(),
+def _compute_sig(ts: str, body: str) -> str:
+    return hmac.new(
+        SHARED_TOKEN.encode("utf-8"),
+        f"{ts}.{body}".encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
-    return hmac.compare_digest(expected, sig)
 
 
-# ── Resample 24kHz → 44.1kHz, mono, 16-bit PCM ──────────────────────────────
-def _resample_wav_to_44100(wav_bytes: bytes) -> bytes:
-    import soundfile as sf
-    import numpy as np
-    from scipy.signal import resample_poly
-    from math import gcd
-
-    with io.BytesIO(wav_bytes) as f:
-        data, sr = sf.read(f, dtype="float32", always_2d=False)
-
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-
-    if sr != TARGET_SR:
-        g = gcd(TARGET_SR, sr)
-        up, down = TARGET_SR // g, sr // g
-        data = resample_poly(data, up, down).astype("float32")
-
-    data = np.clip(data, -1.0, 1.0)
-    pcm16 = (data * 32767.0).astype("<i2")
-
-    out = io.BytesIO()
-    sf.write(out, pcm16, TARGET_SR, format="WAV", subtype="PCM_16")
-    return out.getvalue()
-
-
-# ── Single-segment synthesis ────────────────────────────────────────────────
-def _synth_one(client: httpx.Client, seg: dict, language: str) -> bytes:
-    voice = seg.get("voice", {}) or {}
-    mode = voice.get("mode", "design")
-    text = seg.get("text", "")
-
-    if mode == "clone" and voice.get("ref_audio_b64"):
-        ref_wav = base64.b64decode(voice["ref_audio_b64"])
-        files = {"ref_audio": ("ref.wav", ref_wav, "audio/wav")}
-        data = {
-            "input": text,
-            "ref_text": voice.get("ref_text", ""),
-            "language": language,
-        }
-        adv = voice.get("advanced") or {}
-        if adv:
-            data["advanced"] = json.dumps(adv)
-        r = client.post(
-            f"{OMNI_BASE}/v1/audio/speech/clone",
-            files=files, data=data, timeout=300.0,
-        )
-    else:
-        payload = {
-            "model": "omnivoice",
-            "input": text,
-            "voice": voice.get("voice", "default"),
-            "instructions": voice.get("instructions", ""),
-            "language": language,
-            "response_format": "wav",
-        }
-        adv = voice.get("advanced") or {}
-        if adv:
-            payload["advanced"] = adv
-        r = client.post(
-            f"{OMNI_BASE}/v1/audio/speech",
-            json=payload, timeout=300.0,
-        )
-
-    if r.status_code != 200:
-        raise RuntimeError(f"omnivoice {r.status_code}: {r.text[:300]}")
-
-    return r.content
-
-
-# ── RunPod handler (generator) ──────────────────────────────────────────────
-def handler(event):
+def verify_hmac(inner_without_hmac: Dict[str, Any], hmac_blob: Dict[str, Any]) -> Dict[str, Any]:
     """
-    RunPod serverless generator handler.
-    Yields dicts forwarded as NDJSON lines to the browser.
+    Возвращает dict с диагностикой. Поле `ok` — финальный вердикт.
+    Никогда не бросает исключение — всё в диагностику.
     """
-    inp = event.get("input") or {}
-
-    # Verify HMAC
-    hmac_obj = inp.pop("_hmac", None) or {}
-    ts = str(hmac_obj.get("ts", ""))
-    sig = str(hmac_obj.get("sig", ""))
-    inner_str = _canonical_inner(inp)
-
-    debug = _hmac_debug(inner_str, ts, sig)
-    print(f"[hmac-debug] {json.dumps(debug)}", flush=True)
-
-    if not _verify_signature(inner_str, ts, sig):
-        # Return diagnostics so user can compare with edge function log.
-        yield {
-            "type": "error",
-            "error": "bad_signature",
-            "debug": debug,
-        }
-        return
-
-    # Cold-start the OmniVoice server (idempotent — only on first job)
+    diag: Dict[str, Any] = {"ok": False}
     try:
-        _start_omnivoice_server()
+        ts = str(hmac_blob.get("ts", ""))
+        got_sig = str(hmac_blob.get("sig", ""))
+        if not ts or not got_sig:
+            diag["reason"] = "missing_ts_or_sig"
+            return diag
+
+        # Защита от replay (мягкая — только лог, не отказ)
+        try:
+            ts_int = int(ts)
+            skew = abs(int(time.time() * 1000) - ts_int)
+            diag["skew_ms"] = skew
+            if skew > HMAC_MAX_SKEW_MS:
+                diag["reason"] = "ts_skew_too_large"
+                return diag
+        except ValueError:
+            diag["reason"] = "ts_not_int"
+            return diag
+
+        body = _canonical_inner(inner_without_hmac)
+        expected = _compute_sig(ts, body)
+
+        diag["inner_len_bytes"] = len(body.encode("utf-8"))
+        diag["inner_sha256"] = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        diag["inner_head"] = body[:80]
+        diag["inner_tail"] = body[-80:]
+        diag["expected_sig"] = expected
+        diag["got_sig_prefix"] = got_sig[:16]
+        diag["shared_token_len"] = len(SHARED_TOKEN)
+
+        diag["ok"] = hmac.compare_digest(expected, got_sig)
+        if not diag["ok"]:
+            diag["reason"] = "sig_mismatch"
+        return diag
     except Exception as e:
-        yield {"type": "error", "error": f"omnivoice_boot_failed: {e}"}
-        return
+        diag["reason"] = "exception"
+        diag["error"] = repr(e)
+        diag["trace"] = traceback.format_exc()[-500:]
+        return diag
 
-    segments = inp.get("segments") or []
-    language = inp.get("language", "en")
-    scene_id = inp.get("scene_id", "")
-    total = len(segments)
 
+# ─────────────────────────── Payload validation ────────────────────────────
+
+def validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"ok": False, "reason": "payload_not_dict"}
+
+    has_single = isinstance(payload.get("scene_id"), str) and isinstance(payload.get("segments"), list)
+    has_batch = isinstance(payload.get("scenes"), list) and len(payload.get("scenes", [])) > 0
+    if not (has_single or has_batch):
+        return {"ok": False, "reason": "missing_scene_or_scenes"}
+
+    if has_single and len(payload["segments"]) == 0:
+        return {"ok": False, "reason": "segments_empty"}
+
+    return {"ok": True, "mode": "single" if has_single else "batch"}
+
+
+# ───────────────────────────────── Handler ─────────────────────────────────
+
+async def handler(job: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
     t0 = time.time()
-    ok_count = 0
-    fail_count = 0
+
+    # 1) Sanity: job/input shape
+    try:
+        raw_input = job.get("input")
+    except Exception as e:
+        yield {"type": "error", "stage": "job_access", "error": repr(e)}
+        return
 
     yield {
         "type": "start",
-        "total": total,
-        "warm": True,
-        "gpu": GPU_NAME,
-        "scene_id": scene_id,
+        "stage": "handler_entry",
+        "received": True,
+        "has_input": raw_input is not None,
+        "input_type": type(raw_input).__name__,
+        "input_keys": list(raw_input.keys()) if isinstance(raw_input, dict) else None,
+        "shared_token_configured": bool(SHARED_TOKEN),
+        "shared_token_len": len(SHARED_TOKEN),
     }
 
-    with httpx.Client() as client:
+    if not isinstance(raw_input, dict):
+        yield {"type": "error", "stage": "input_shape", "error": "input is not a dict"}
+        return
+
+    # 2) Извлечь _hmac и подготовить inner без _hmac (точно как Edge подписывает)
+    hmac_blob = raw_input.get("_hmac")
+    if not isinstance(hmac_blob, dict):
+        yield {
+            "type": "error",
+            "stage": "hmac_missing",
+            "error": "no _hmac in input",
+            "input_keys": list(raw_input.keys()),
+        }
+        return
+
+    inner_without_hmac = {k: v for k, v in raw_input.items() if k != "_hmac"}
+
+    # 3) HMAC verify с полной диагностикой
+    hmac_diag = verify_hmac(inner_without_hmac, hmac_blob)
+    yield {"type": "hmac_check", **hmac_diag}
+
+    if not hmac_diag.get("ok"):
+        yield {"type": "error", "stage": "hmac_failed", "diag": hmac_diag}
+        return
+
+    # 4) Валидация payload
+    val = validate_payload(inner_without_hmac)
+    yield {"type": "payload_validate", **val}
+    if not val.get("ok"):
+        yield {"type": "error", "stage": "payload_invalid", "reason": val.get("reason")}
+        return
+
+    # 5) Извлечь сегменты + options
+    options = inner_without_hmac.get("options", {}) or {}
+    engine = options.get("engine", "omnivoice")
+    yield {
+        "type": "config",
+        "engine": engine,
+        "vc_model": options.get("vc_model"),
+        "voice": options.get("voice") or inner_without_hmac.get("narrator", {}).get("voice"),
+        "scene_id": inner_without_hmac.get("scene_id"),
+        "segments_count": len(inner_without_hmac.get("segments", []))
+            if val["mode"] == "single"
+            else sum(len(s.get("segments", [])) for s in inner_without_hmac.get("scenes", [])),
+    }
+
+    # 6) Синтез — обернуть в try, чтобы любая ошибка летела наружу как event
+    try:
+        segments = inner_without_hmac.get("segments", []) if val["mode"] == "single" else [
+            seg for sc in inner_without_hmac["scenes"] for seg in sc.get("segments", [])
+        ]
+        total = len(segments)
+
+        yield {"type": "synthesis_start", "total": total}
+
         for i, seg in enumerate(segments):
-            seg_id = seg.get("segment_id", f"seg_{i}")
-            speaker = seg.get("speaker", "narrator")
+            seg_t0 = time.time()
             try:
-                wav24 = _synth_one(client, seg, language)
-                wav44 = _resample_wav_to_44100(wav24)
-
-                # 16-bit mono → (bytes - 44 header) / 2 samples
-                samples = max(0, (len(wav44) - 44) // 2)
-                duration_ms = int(samples * 1000 / TARGET_SR)
-
-                wav_b64 = base64.b64encode(wav44).decode("ascii")
-                ok_count += 1
-
+                # ──────────────────────────────────────────────────────────
+                # TODO: здесь должен быть реальный вызов синтеза:
+                #   wav_bytes = synthesize_segment(seg, engine, options)
+                #   audio_b64 = base64.b64encode(wav_bytes).decode()
+                # Пока заглушка, чтобы валидировать сквозной NDJSON-контракт.
+                # ──────────────────────────────────────────────────────────
                 yield {
-                    "type": "segment",
+                    "type": "segment_stub",
                     "index": i,
-                    "segment_id": seg_id,
-                    "speaker": speaker,
-                    "duration_ms": duration_ms,
-                    "wav_b64": wav_b64,
+                    "segment_id": seg.get("id") or seg.get("segment_id"),
+                    "speaker": seg.get("speaker"),
+                    "text_len": len(seg.get("text", "")),
+                    "elapsed_ms": int((time.time() - seg_t0) * 1000),
+                    "note": "synthesis_not_implemented_yet",
                 }
             except Exception as e:
-                fail_count += 1
                 yield {
                     "type": "error",
+                    "stage": "segment",
                     "index": i,
-                    "segment_id": seg_id,
-                    "speaker": speaker,
-                    "error": str(e)[:500],
+                    "error": repr(e),
+                    "trace": traceback.format_exc()[-500:],
                 }
+                # продолжаем со следующим сегментом
 
-    yield {
-        "type": "done",
-        "total_ms": int((time.time() - t0) * 1000),
-        "segments_ok": ok_count,
-        "segments_failed": fail_count,
-    }
+        yield {
+            "type": "done",
+            "total": total,
+            "wall_ms": int((time.time() - t0) * 1000),
+        }
+
+    except Exception as e:
+        yield {
+            "type": "error",
+            "stage": "synthesis_loop",
+            "error": repr(e),
+            "trace": traceback.format_exc()[-500:],
+        }
 
 
-# ── Entrypoint ──────────────────────────────────────────────────────────────
+# ─────────────────────────────── Bootstrap ─────────────────────────────────
+
 runpod.serverless.start({
     "handler": handler,
     "return_aggregate_stream": True,
