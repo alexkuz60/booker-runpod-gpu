@@ -1,5 +1,15 @@
 """
-booker-runpod-gpu — RunPod Serverless handler with FULL diagnostic yields.
+booker-runpod-gpu — RunPod Serverless handler (SYNC generator).
+
+ВАЖНО:
+  - Используем СИНХРОННЫЙ генератор (def + yield), а НЕ async def + yield.
+    Async generators поддерживаются только в RunPod SDK >= 1.5, и даже там
+    в режиме `return_aggregate_stream` иногда возвращают пустой stream.
+    Sync generator работает на всех версиях SDK без сюрпризов.
+
+  - runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
+    → каждый yield попадает в /stream/{id} как chunk.stream[].output
+    → и финально дублируется в job.output как массив.
 
 Контракт со стороны Lovable Edge (synthesize-scene-runpod):
   - RunPod payload: { "input": { ...innerInput, "_hmac": {"ts": "...", "sig": "..."} } }
@@ -7,11 +17,9 @@ booker-runpod-gpu — RunPod Serverless handler with FULL diagnostic yields.
   - HMAC SHA-256:  hex( HMAC(SHARED_TOKEN, f"{ts}.{json.dumps(innerInput, separators=(',',':'), ensure_ascii=False)}") )
   - innerInput НЕ содержит ключа "_hmac" на момент подписи (он добавляется ПОСЛЕ подписи).
 
-КРИТИЧНО:
-  1. handler — async generator с yield (НЕ return [...]).
-  2. runpod.serverless.start({"handler": handler, "return_aggregate_stream": True}).
-  3. Любая ошибка/валидация — yield {"type":"error", ...}; return  (НЕ молчаливый return).
-  4. Первый yield — "start" с эхом ключей payload, чтобы видеть, что handler вообще получил данные.
+Первый yield — "start" с эхом ключей payload, чтобы СРАЗУ видеть, что handler
+получил данные. Если в Edge-логах [runpod-proxy][chunk] видно stream_len>=1
+с type=start — значит handler жив, дальше смотрим следующие events.
 """
 
 import os
@@ -20,7 +28,7 @@ import hmac
 import hashlib
 import time
 import traceback
-from typing import Any, Dict, AsyncGenerator
+from typing import Any, Dict, Generator
 
 import runpod
 
@@ -33,10 +41,10 @@ HMAC_MAX_SKEW_MS = 10 * 60 * 1000  # 10 минут — окно для ts
 
 def _canonical_inner(payload_without_hmac: Dict[str, Any]) -> str:
     """
-    ВАЖНО: точное совпадение с тем, что подписывает Edge:
-      JSON.stringify(innerInput)  ⟶ json.dumps(..., separators=(',',':'), ensure_ascii=False)
-    Порядок ключей в Python 3.7+ сохраняется как insertion order, что соответствует
-    JavaScript object property order для строковых ключей.
+    Точное совпадение с тем, что подписывает Edge:
+      JSON.stringify(innerInput) ⟶ json.dumps(..., separators=(',',':'), ensure_ascii=False)
+    Порядок ключей в Python 3.7+ сохраняется как insertion order — то же, что
+    в JavaScript object property order для строковых ключей.
     """
     return json.dumps(payload_without_hmac, separators=(",", ":"), ensure_ascii=False)
 
@@ -50,10 +58,6 @@ def _compute_sig(ts: str, body: str) -> str:
 
 
 def verify_hmac(inner_without_hmac: Dict[str, Any], hmac_blob: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Возвращает dict с диагностикой. Поле `ok` — финальный вердикт.
-    Никогда не бросает исключение — всё в диагностику.
-    """
     diag: Dict[str, Any] = {"ok": False}
     try:
         ts = str(hmac_blob.get("ts", ""))
@@ -62,7 +66,6 @@ def verify_hmac(inner_without_hmac: Dict[str, Any], hmac_blob: Dict[str, Any]) -
             diag["reason"] = "missing_ts_or_sig"
             return diag
 
-        # Защита от replay (мягкая — только лог, не отказ)
         try:
             ts_int = int(ts)
             skew = abs(int(time.time() * 1000) - ts_int)
@@ -114,8 +117,9 @@ def validate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ───────────────────────────────── Handler ─────────────────────────────────
+# СИНХРОННЫЙ генератор — def, не async def!
 
-async def handler(job: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
+def handler(job: Dict[str, Any]) -> Generator[Dict[str, Any], None, None]:
     t0 = time.time()
 
     # 1) Sanity: job/input shape
@@ -134,13 +138,14 @@ async def handler(job: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
         "input_keys": list(raw_input.keys()) if isinstance(raw_input, dict) else None,
         "shared_token_configured": bool(SHARED_TOKEN),
         "shared_token_len": len(SHARED_TOKEN),
+        "runpod_sdk_version": getattr(runpod, "__version__", "unknown"),
     }
 
     if not isinstance(raw_input, dict):
         yield {"type": "error", "stage": "input_shape", "error": "input is not a dict"}
         return
 
-    # 2) Извлечь _hmac и подготовить inner без _hmac (точно как Edge подписывает)
+    # 2) Извлечь _hmac и подготовить inner без _hmac
     hmac_blob = raw_input.get("_hmac")
     if not isinstance(hmac_blob, dict):
         yield {
@@ -175,14 +180,14 @@ async def handler(job: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
         "type": "config",
         "engine": engine,
         "vc_model": options.get("vc_model"),
-        "voice": options.get("voice") or inner_without_hmac.get("narrator", {}).get("voice"),
+        "voice": options.get("voice") or (inner_without_hmac.get("narrator") or {}).get("voice"),
         "scene_id": inner_without_hmac.get("scene_id"),
         "segments_count": len(inner_without_hmac.get("segments", []))
             if val["mode"] == "single"
             else sum(len(s.get("segments", [])) for s in inner_without_hmac.get("scenes", [])),
     }
 
-    # 6) Синтез — обернуть в try, чтобы любая ошибка летела наружу как event
+    # 6) Синтез — stub, чтобы валидировать сквозной NDJSON-контракт
     try:
         segments = inner_without_hmac.get("segments", []) if val["mode"] == "single" else [
             seg for sc in inner_without_hmac["scenes"] for seg in sc.get("segments", [])
@@ -194,12 +199,9 @@ async def handler(job: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
         for i, seg in enumerate(segments):
             seg_t0 = time.time()
             try:
-                # ──────────────────────────────────────────────────────────
-                # TODO: здесь должен быть реальный вызов синтеза:
+                # TODO: здесь — реальный синтез.
                 #   wav_bytes = synthesize_segment(seg, engine, options)
                 #   audio_b64 = base64.b64encode(wav_bytes).decode()
-                # Пока заглушка, чтобы валидировать сквозной NDJSON-контракт.
-                # ──────────────────────────────────────────────────────────
                 yield {
                     "type": "segment_stub",
                     "index": i,
@@ -217,7 +219,6 @@ async def handler(job: Dict[str, Any]) -> AsyncGenerator[Dict[str, Any], None]:
                     "error": repr(e),
                     "trace": traceback.format_exc()[-500:],
                 }
-                # продолжаем со следующим сегментом
 
         yield {
             "type": "done",
