@@ -1,50 +1,9 @@
 # handler.py — Booker GPU backend on RunPod Serverless (OmniVoice via omnivoice-server)
 # ============================================================================
-# Architecture:
-#   - One container per worker (RTX 4090 / A100), stays warm by RunPod
-#     `Active Workers` setting (or scales from 0 with cold-start ~5-20s).
-#   - On cold start we boot `omnivoice-server --device cuda` once as a
-#     subprocess on 127.0.0.1:8880 and wait for /health. HF model weights are
-#     cached in a Network Volume mounted at /runpod-volume so subsequent cold
-#     starts are fast (~30-60s vs minutes).
-#   - Handler is a GENERATOR (yields dicts). RunPod auto-aggregates them into
-#     the /stream/{job_id} long-poll. The Lovable edge function
-#     `synthesize-scene-runpod` forwards each yielded dict 1:1 as NDJSON to
-#     the browser, so the contract is identical to the Modal backend.
-#
-# Contract with the Lovable edge function:
-#   Input event = { "input": {
-#       "user_id_hash": "sha256(user_id)[:16]",
-#       "scene_id":     "uuid",
-#       "language":     "ru" | "en",
-#       "segments": [
-#         {
-#           "segment_id": "uuid",
-#           "speaker":    "Алекс",
-#           "text":       "Привет, мир.",
-#           "voice": {                         # OmniVoice request payload
-#             "mode":    "design" | "clone" | "auto",
-#             "voice":   "<preset>",           # design mode
-#             "instructions": "calm, warm",    # design mode
-#             "ref_audio_b64": "...",          # clone mode (24kHz mono WAV)
-#             "ref_text":      "...",          # clone mode
-#             "advanced": { ... }              # OmniVoice Advanced params
-#           }
-#         },
-#         ...
-#       ],
-#       "_hmac": { "ts": "<ms>", "sig": "<sha256-hex>" }
-#   } }
-#
-#   Yielded objects (one per call → one NDJSON line on the client):
-#     {"type":"start","total":N,"warm":true,"gpu":"<RUNPOD_GPU>"}
-#     {"type":"segment","index":i,"segment_id":"...","speaker":"...",
-#      "duration_ms":N,"wav_b64":"..."}
-#     {"type":"error","index":i,"segment_id":"...","speaker":"...","error":"..."}
-#     {"type":"done","total_ms":N,"segments_ok":N,"segments_failed":N}
-#
-# WAV format: 44.1 kHz / 16-bit / mono (per project Audio Standard).
-# OmniVoice natively outputs 24 kHz — we resample to 44.1 kHz before base64.
+# v2 (2026-05-31): добавлена HMAC-диагностика. При bad_signature handler
+# возвращает поля для побайтового сравнения с edge function:
+#   inner_len_bytes, inner_sha256, inner_head, inner_tail, ts, sig.
+# Сравните их с логом `[runpod-proxy][hmac-debug]` в Supabase Edge Logs.
 # ============================================================================
 
 import os
@@ -75,14 +34,12 @@ def _start_omnivoice_server():
     """Boot omnivoice-server as a subprocess and wait for /health."""
     global _server_proc
     if _server_proc and _server_proc.poll() is None:
-        return  # already running
+        return
 
     runtime_dir = "/tmp/omnivoice-runtime"
     os.makedirs(runtime_dir, exist_ok=True)
 
     env = os.environ.copy()
-    # Prevent pydantic-settings inside omnivoice-server from picking up
-    # unrelated runtime env vars.
     for k in list(env.keys()):
         if k.startswith(("VITE_", "SUPABASE_", "RUNPOD_")):
             env.pop(k, None)
@@ -103,7 +60,7 @@ def _start_omnivoice_server():
         text=True,
     )
 
-    deadline = time.time() + 600  # first run downloads weights
+    deadline = time.time() + 600
     last_err = None
     started = time.time()
     with httpx.Client(timeout=5.0) as client:
@@ -124,7 +81,34 @@ def _start_omnivoice_server():
     raise RuntimeError(f"omnivoice-server /health timeout: {last_err}")
 
 
-# ── HMAC verification (matches edge synthesize-scene-runpod) ─────────────────
+# ── HMAC verification + diagnostics ─────────────────────────────────────────
+def _canonical_inner(inp_without_hmac: dict) -> str:
+    """
+    Re-serialize inner payload matching JS default `JSON.stringify`:
+      - no extra whitespace
+      - keys NOT sorted (insertion order preserved)
+      - ensure_ascii=False (non-ASCII written as UTF-8)
+    NOTE: This is the known weak point — Python and JS may still differ on
+    float formatting (1.0 vs 1) and Unicode normalization. The debug fields
+    below let us pinpoint any mismatch byte-by-byte.
+    """
+    return json.dumps(inp_without_hmac, separators=(",", ":"), ensure_ascii=False)
+
+
+def _hmac_debug(inner_str: str, ts: str, sig: str) -> dict:
+    inner_bytes = inner_str.encode("utf-8")
+    sha = hashlib.sha256(inner_bytes).hexdigest()
+    return {
+        "ts": ts,
+        "sig": sig,
+        "inner_len_bytes": len(inner_bytes),
+        "inner_sha256": sha,
+        "inner_head": inner_str[:80],
+        "inner_tail": inner_str[-80:],
+        "shared_token_len": len(SHARED_TOKEN),
+    }
+
+
 def _verify_signature(input_str: str, ts: str, sig: str) -> bool:
     if not SHARED_TOKEN or not ts or not sig:
         return False
@@ -168,7 +152,7 @@ def _resample_wav_to_44100(wav_bytes: bytes) -> bytes:
     return out.getvalue()
 
 
-# ── Single-segment synthesis (sync — runs inside generator) ─────────────────
+# ── Single-segment synthesis ────────────────────────────────────────────────
 def _synth_one(client: httpx.Client, seg: dict, language: str) -> bytes:
     voice = seg.get("voice", {}) or {}
     mode = voice.get("mode", "design")
@@ -209,14 +193,14 @@ def _synth_one(client: httpx.Client, seg: dict, language: str) -> bytes:
     if r.status_code != 200:
         raise RuntimeError(f"omnivoice {r.status_code}: {r.text[:300]}")
 
-    return r.content  # raw 24kHz WAV from OmniVoice
+    return r.content
 
 
 # ── RunPod handler (generator) ──────────────────────────────────────────────
 def handler(event):
     """
     RunPod serverless generator handler.
-    Yields dicts that are forwarded as NDJSON lines to the browser.
+    Yields dicts forwarded as NDJSON lines to the browser.
     """
     inp = event.get("input") or {}
 
@@ -224,16 +208,18 @@ def handler(event):
     hmac_obj = inp.pop("_hmac", None) or {}
     ts = str(hmac_obj.get("ts", ""))
     sig = str(hmac_obj.get("sig", ""))
-    inner_str = json.dumps(inp, separators=(",", ":"), ensure_ascii=False)
-    # Edge signs over the inner JSON — but JSON canonicalization differs
-    # between TS JSON.stringify and Python json.dumps. To match the edge,
-    # we sign over the EXACT raw payload as it arrived in `input` minus
-    # `_hmac`. We re-serialize here only for verification; the edge MUST
-    # use the same canonical form (no whitespace, sorted keys disabled).
-    # If signatures don't match in production, switch to passing the raw
-    # signed body through a dedicated `_signed_payload` field.
+    inner_str = _canonical_inner(inp)
+
+    debug = _hmac_debug(inner_str, ts, sig)
+    print(f"[hmac-debug] {json.dumps(debug)}", flush=True)
+
     if not _verify_signature(inner_str, ts, sig):
-        yield {"type": "error", "error": "bad_signature"}
+        # Return diagnostics so user can compare with edge function log.
+        yield {
+            "type": "error",
+            "error": "bad_signature",
+            "debug": debug,
+        }
         return
 
     # Cold-start the OmniVoice server (idempotent — only on first job)
@@ -268,9 +254,9 @@ def handler(event):
                 wav24 = _synth_one(client, seg, language)
                 wav44 = _resample_wav_to_44100(wav24)
 
-                # estimate duration: 16-bit mono → (bytes - 44 header) / 2
-                n_samples = max(0, (len(wav44) - 44) // 2)
-                duration_ms = int(n_samples * 1000 / TARGET_SR)
+                # 16-bit mono → (bytes - 44 header) / 2 samples
+                samples = max(0, (len(wav44) - 44) // 2)
+                duration_ms = int(samples * 1000 / TARGET_SR)
 
                 wav_b64 = base64.b64encode(wav44).decode("ascii")
                 ok_count += 1
@@ -302,8 +288,6 @@ def handler(event):
 
 
 # ── Entrypoint ──────────────────────────────────────────────────────────────
-# RunPod Serverless entrypoint — must be at module level so RunPod's
-# GitHub indexer can detect runpod.serverless.start() in the default branch.
 runpod.serverless.start({
     "handler": handler,
     "return_aggregate_stream": True,
