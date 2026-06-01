@@ -1,13 +1,14 @@
-# Dockerfile v3 — Booker GPU backend for RunPod Serverless
-# CUDA 12.1 + cuDNN 8, Python 3.11.
+# Dockerfile v5 — Booker GPU backend for RunPod Serverless
+# Base: RunPod official image (CUDA 12.8 + cuDNN 9 + stable Python 3.11)
 #
-# FIX v3: при --force-reinstall --no-deps transformers 4.46.3 остаётся с
-# huggingface_hub==1.17.0 (его подтянул transformers 5.x). 4.46 несовместим
-# с hub>=1.0 — AutoFeatureExtractor падает ещё на импорте. Принудительно
-# откатываем huggingface_hub до 0.26.x и tokenizers до 0.20.x В ОДНОЙ
-# pip-команде, чтобы резолвер увидел совместимый набор.
+# Зачем v5:
+#  - CUDA 12.8 (вместо 12.1) — поддержка Blackwell (RTX 5090 / RTX 6000 Pro, sm_120).
+#  - PyTorch 2.6 + cu128 wheels (под 12.1 был torch 2.4, на Blackwell не работает).
+#  - Стабильный Python 3.11.x из runpod/base (а не 3.11.0rc1 из ubuntu22.04 nvidia-image).
+#  - runpod SDK явно зафиксирован на 1.9.0 (раньше pip ставил 1.7).
+#  - transformers 5.8.1 оставляем — содержит HiggsAudioV2TokenizerModel.
 
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM runpod/base:0.6.2-cuda12.8.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
@@ -15,34 +16,32 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HOME=/runpod-volume/hf-cache \
     OMNIVOICE_CACHE_DIR=/runpod-volume/hf-cache
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 python3.11-venv python3-pip git ffmpeg ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python \
-    && python -m pip install --upgrade pip
+# runpod/base уже содержит python3.11 + pip + ffmpeg + git, но проверим/обновим
+RUN python3.11 -m pip install --upgrade pip \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python
 
 WORKDIR /app
 
-RUN pip install --index-url https://download.pytorch.org/whl/cu121 \
-        torch==2.4.0 torchaudio==2.4.0
+# --- Torch stack под CUDA 12.8 (Blackwell-ready) ---
+RUN pip install --index-url https://download.pytorch.org/whl/cu128 \
+        torch==2.6.0 torchaudio==2.6.0
 
-RUN pip install runpod==1.7.0 numpy
+# --- RunPod SDK + численная база ---
+RUN pip install runpod==1.9.0 numpy scipy soundfile httpx
 
-# OmniVoice + omnivoice-server (тянут transformers 5.x и hub 1.x как deps)
+# --- OmniVoice + omnivoice-server (из git, без кэша) ---
 RUN pip install \
         "git+https://github.com/k2-fsa/OmniVoice.git" \
         "git+https://github.com/maemreyo/omnivoice-server.git@main"
 
-# КРИТИЧНО: откатываем весь HF-стек к 4.x-совместимому набору ОДНОЙ командой.
-# huggingface_hub<1.0 обязателен — иначе transformers 4.46 не стартует.
-RUN pip install --force-reinstall --no-deps \
-        "transformers==4.46.3" \
-        "tokenizers>=0.20,<0.21" \
-        "huggingface_hub>=0.26,<1.0" \
-        "safetensors>=0.4.5"
+# --- Жёстко фиксируем transformers 5.8.1 (HiggsAudioV2TokenizerModel внутри).
+#     Без --no-deps: pip сам подтянет совместимые hub/tokenizers/safetensors.
+RUN pip install --upgrade "transformers==5.8.1"
 
-# Sanity check
-RUN python -c "from transformers import AutoFeatureExtractor, AutoTokenizer, AutoModel; import transformers, huggingface_hub; print('transformers', transformers.__version__, 'hub', huggingface_hub.__version__)"
+# --- Sanity checks: CUDA доступна, импорты не падают, версии совпадают ---
+RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'cudnn', torch.backends.cudnn.version())"
+RUN python -c "from transformers import AutoFeatureExtractor, AutoTokenizer, AutoModel, HiggsAudioV2TokenizerModel; import transformers, huggingface_hub, tokenizers; print('transformers', transformers.__version__, 'hub', huggingface_hub.__version__, 'tokenizers', tokenizers.__version__)"
+RUN python -c "import runpod; print('runpod', runpod.__version__)"
 
 COPY handler.py /app/handler.py
 
