@@ -205,14 +205,27 @@ def _collect_segments(inner: Dict[str, Any], mode: str) -> List[Dict[str, Any]]:
 
 def _tensor_to_int16_mono_48k(tensor) -> Tuple[bytes, int]:
     """
-    OmniVoice → list[torch.Tensor], каждый (1, T) float в [-1, 1] @ 24kHz.
+    OmniVoice → list[torch.Tensor | np.ndarray], каждый (1, T) или (T,)
+    float в [-1, 1] @ 24kHz.
     Возвращаем (pcm_int16_bytes, duration_ms) уже @ 48kHz mono.
     Bit-perfect integer ×2 upsample (np.repeat) — соответствует Audio Standard.
+
+    v7-fix: защита от того, что OmniVoice вернёт np.ndarray, а не torch.Tensor —
+    в этом случае .detach() падает с AttributeError и весь сегмент теряется.
     """
     import numpy as np
-    import torch  # noqa
 
-    arr = tensor.detach().to("cpu").float().numpy()
+    # 1) Унификация в numpy float32 на CPU, без предположений о типе.
+    if hasattr(tensor, "detach"):
+        # torch.Tensor (любой device/dtype)
+        arr = tensor.detach().to("cpu").float().numpy()
+    elif hasattr(tensor, "cpu") and hasattr(tensor, "numpy"):
+        # torch.Tensor без grad
+        arr = tensor.cpu().float().numpy()
+    else:
+        # Уже np.ndarray (или совместимое)
+        arr = np.asarray(tensor, dtype=np.float32)
+
     if arr.ndim > 1:
         arr = arr.reshape(-1)
     # Clip и в int16
