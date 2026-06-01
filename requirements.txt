@@ -1,24 +1,29 @@
-# requirements.txt — Booker GPU backend on RunPod Serverless
+# requirements.txt v5 — Booker GPU backend on RunPod Serverless
 # ============================================================================
-# Pinned to match local install (scripts/install-omnivoice.sh) and
-# Modal backend (modal_app.py). CUDA 12.1 base image provides cu121 wheels.
-# OmniVoice + omnivoice-server are installed from git in the Dockerfile,
-# not here, to keep this file fast to re-resolve on rebuild.
+# Базовый образ: runpod/base:0.6.2-cuda12.8.1 (CUDA 12.8, cuDNN 9, Python 3.11.x).
+# Поддержка Blackwell (RTX 5090, RTX 6000 Pro, sm_120) требует CUDA >= 12.8
+# и torch >= 2.6 с cu128 wheels.
+#
+# OmniVoice + omnivoice-server ставятся из git в Dockerfile (не здесь),
+# чтобы requirements.txt быстро ре-резолвился при rebuild.
 # ============================================================================
 
-# RunPod Serverless SDK
-runpod>=1.7.0
+# --- RunPod Serverless SDK (жёсткий пин, не нижняя граница) ---
+runpod==1.9.0
 
-# Torch stack (CUDA 12.1 wheels resolved by torch index)
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.4.0
-torchaudio==2.4.0
+# --- Torch stack под CUDA 12.8 (Blackwell-ready) ---
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.6.0
+torchaudio==2.6.0
 
-# HTTP + audio
+# --- HTTP + audio + численная база ---
 httpx>=0.27.0
 soundfile>=0.12.1
 numpy>=1.26.0
 scipy>=1.13.0
 
-# OmniVoice server pulls fastapi/uvicorn itself, but pin httpx so our
-# subprocess client matches.
+# --- Transformers с HiggsAudioV2TokenizerModel (нужен OmniVoice) ---
+transformers==5.8.1
+
+# httpx пиним отдельно — наш subprocess-клиент должен совпадать
+# с тем httpx, который тянет fastapi/uvicorn внутри omnivoice-server.
