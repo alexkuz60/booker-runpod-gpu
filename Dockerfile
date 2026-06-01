@@ -51,3 +51,5 @@ RUN python -c "import runpod; print(f'[sanity] runpod=={runpod.__version__}')"
 COPY . .
 
 CMD ["python", "-u", "handler.py"]
+
+# Rebuild trigger: 2026-06-01 (force CUDA 12.4 base)
